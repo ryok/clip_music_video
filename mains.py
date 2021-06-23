@@ -1,17 +1,25 @@
-from utils          import train, Pars, create_image, create_outputfolder, init_textfile
+from utils          import train, Pars, create_image, create_outputfolder, init_textfile, vector_quantize, clamp_with_grad, replace_grad
 from dall_e         import map_pixels, unmap_pixels, load_model
 from stylegan       import g_synthesis
 from biggan         import BigGAN
 from tqdm           import tqdm
+from omegaconf import OmegaConf
 
 import create_video
 import tempfile
 import argparse
 import torch
-import clip
+# import clip
+from CLIP import clip
 import glob
 import os
 import math
+from torch.nn import functional as F
+
+import sys
+sys.path.append('./taming-transformers')
+
+from taming.models import cond_transformer, vqgan
 
 
 # Argsparse for commandline options
@@ -25,7 +33,7 @@ parser.add_argument('--epochs',
 parser.add_argument('--generator', 
                     default = 'biggan', 
                     type    = str, 
-                    choices = ['biggan', 'dall-e', 'stylegan'],
+                    choices = ['biggan', 'dall-e', 'stylegan', 'vqgan'],
                     help    = 'Choose what type of generator you would like to use BigGan or Dall-E')
 
 parser.add_argument('--textfile', 
@@ -60,13 +68,68 @@ lyrics      = args.lyrics
 sideX       = 512
 sideY       = 512
 
+
+# class ReplaceGrad(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, x_forward, x_backward):
+#         ctx.shape = x_backward.shape
+#         return x_forward
+
+#     @staticmethod
+#     def backward(ctx, grad_in):
+#         return None, grad_in.sum_to_size(ctx.shape)
+
+
+# replace_grad = ReplaceGrad.apply
+
+# class ClampWithGrad(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, input, min, max):
+#         ctx.min = min
+#         ctx.max = max
+#         ctx.save_for_backward(input)
+#         return input.clamp(min, max)
+
+#     @staticmethod
+#     def backward(ctx, grad_in):
+#         input, = ctx.saved_tensors
+#         return grad_in * (grad_in * (input - input.clamp(ctx.min, ctx.max)) >= 0), None, None
+
+
+# clamp_with_grad = ClampWithGrad.apply
+
+# def vector_quantize(x, codebook):
+#     d = x.pow(2).sum(dim=-1, keepdim=True) + codebook.pow(2).sum(dim=1) - 2 * x @ codebook.T
+#     indices = d.argmin(-1)
+#     x_q = F.one_hot(indices, codebook.shape[0]).to(d.dtype) @ codebook
+#     return replace_grad(x_q, x)
+
+
+def load_vqgan_model(config_path, checkpoint_path):
+    config = OmegaConf.load(config_path)
+    if config.model.target == 'taming.models.vqgan.VQModel':
+        model = vqgan.VQModel(**config.model.params)
+        model.eval().requires_grad_(False)
+        model.init_from_ckpt(checkpoint_path)
+    elif config.model.target == 'taming.models.cond_transformer.Net2NetTransformer':
+        parent_model = cond_transformer.Net2NetTransformer(**config.model.params)
+        parent_model.eval().requires_grad_(False)
+        parent_model.init_from_ckpt(checkpoint_path)
+        model = parent_model.first_stage_model
+    else:
+        raise ValueError(f'unknown model type: {config.model.target}')
+    del model.loss
+    return model
+
+
 def main():
 
     # Automatically creates 'output' folder
     create_outputfolder()
 
     # Initialize Clip
-    perceptor, preprocess   = clip.load('ViT-B/32')
+    # perceptor, preprocess   = clip.load('ViT-B/32')
+    perceptor, preprocess   = clip.load('ViT-B/32', jit=False)
     perceptor               = perceptor.eval()
 
     # Load the model
@@ -77,6 +140,10 @@ def main():
         model   = load_model("decoder.pkl", 'cuda')
     elif generator == 'stylegan':
         model   = g_synthesis.eval().cuda()
+    elif generator == 'vqgan':
+        model   = load_vqgan_model(
+            'vqgan_imagenet_f16_1024.yaml', 
+            'vqgan_imagenet_f16_1024.ckpt').cuda()
 
     # Read the textfile 
     # descs - list to append the Description and Timestamps
@@ -92,7 +159,7 @@ def main():
         line = d[1]
         # stamps_descs_list.append((timestamp, line))
 
-        lats = Pars(gen=generator).cuda()
+        lats = Pars(gen=generator, model=model).cuda()
 
          # Init Generator's latents
         if generator == 'biggan':
@@ -104,12 +171,15 @@ def main():
         elif generator == 'dall-e':
             par     = [lats.normu]
             lr      = .1
+        elif generator == 'vqgan':
+            par     = [lats.normu]
+            lr      = 0.05
 
         # Init optimizer
         optimizer = torch.optim.Adam(par, lr)
 
         # tokenize the current description with clip and encode the text
-        txt = clip.tokenize(line)
+        txt = clip.tokenize(line + ", unreal engine")
         percep = perceptor.encode_text(txt.cuda()).detach().clone()
 
         # Training Loop
@@ -123,6 +193,7 @@ def main():
         #append it to templist so it can be accessed later
         templist.append(latent_temp)
     return templist, descs, model
+
 
 def sigmoid(x):
     x = x * 2. - 1.
@@ -188,6 +259,11 @@ def interpolate(templist, descs, model, audiofile):
                     img = img[0]
                 elif generator == 'stylegan':
                     img = model(azs[0])
+                elif generator == 'vqgan':
+                    z_q = vector_quantize(azs[0].movedim(1, 3), model.quantize.embedding.weight).movedim(3, 1)
+                    img = clamp_with_grad(model.decode(z_q).add(1).div(2), 0, 1).cpu()
+                    img = img[0]
+                    # img = synth(azs[0])
                 image_temp = create_image(img, t, current_lyric, generator)
             image_temp_list.append(image_temp)
 
