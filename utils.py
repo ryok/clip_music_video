@@ -10,7 +10,130 @@ import torch
 import time
 import os
 import re
+from torch import nn, optim
+from torch.nn import functional as F
+from torchvision import transforms
+import math
 
+
+class Prompt(nn.Module):
+    def __init__(self, embed, weight=1., stop=float('-inf')):
+        super().__init__()
+        self.register_buffer('embed', embed)
+        self.register_buffer('weight', torch.as_tensor(weight))
+        self.register_buffer('stop', torch.as_tensor(stop))
+
+    def forward(self, input):
+        input_normed = F.normalize(input.unsqueeze(1), dim=2)
+        embed_normed = F.normalize(self.embed.unsqueeze(0), dim=2)
+        dists = input_normed.sub(embed_normed).norm(dim=2).div(2).arcsin().pow(2).mul(2)
+        dists = dists * self.weight.sign()
+        return self.weight.abs() * replace_grad(dists, torch.maximum(dists, self.stop)).mean()
+
+
+def parse_prompt(prompt):
+    vals = prompt.rsplit(':', 2)
+    vals = vals + ['', '1', '-inf'][len(vals):]
+    return vals[0], float(vals[1]), float(vals[2])
+
+
+def sinc(x):
+    return torch.where(x != 0, torch.sin(math.pi * x) / (math.pi * x), x.new_ones([]))
+
+def lanczos(x, a):
+    cond = torch.logical_and(-a < x, x < a)
+    out = torch.where(cond, sinc(x) * sinc(x/a), x.new_zeros([]))
+    return out / out.sum()
+
+def ramp(ratio, width):
+    n = math.ceil(width / ratio + 1)
+    out = torch.empty([n])
+    cur = 0
+    for i in range(out.shape[0]):
+        out[i] = cur
+        cur += ratio
+    return torch.cat([-out[1:].flip([0]), out])[1:-1]
+
+def resample(input, size, align_corners=True):
+    n, c, h, w = input.shape
+    dh, dw = size
+
+    input = input.view([n * c, 1, h, w])
+
+    if dh < h:
+        kernel_h = lanczos(ramp(dh / h, 2), 2).to(input.device, input.dtype)
+        pad_h = (kernel_h.shape[0] - 1) // 2
+        input = F.pad(input, (0, 0, pad_h, pad_h), 'reflect')
+        input = F.conv2d(input, kernel_h[None, None, :, None])
+
+    if dw < w:
+        kernel_w = lanczos(ramp(dw / w, 2), 2).to(input.device, input.dtype)
+        pad_w = (kernel_w.shape[0] - 1) // 2
+        input = F.pad(input, (pad_w, pad_w, 0, 0), 'reflect')
+        input = F.conv2d(input, kernel_w[None, None, None, :])
+
+    input = input.view([n, c, h, w])
+    return F.interpolate(input, size, mode='bicubic', align_corners=align_corners)
+
+
+class MakeCutouts(nn.Module):
+    def __init__(self, cut_size, cutn, cut_pow=1.):
+        super().__init__()
+        self.cut_size = cut_size
+        self.cutn = cutn
+        self.cut_pow = cut_pow
+
+    def forward(self, input):
+        sideY, sideX = input.shape[2:4]
+        max_size = min(sideX, sideY)
+        min_size = min(sideX, sideY, self.cut_size)
+        cutouts = []
+        for _ in range(self.cutn):
+            size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
+            offsetx = torch.randint(0, sideX - size + 1, ())
+            offsety = torch.randint(0, sideY - size + 1, ())
+            cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
+            cutouts.append(resample(cutout, (self.cut_size, self.cut_size)))
+        return clamp_with_grad(torch.cat(cutouts, dim=0), 0, 1)
+
+make_cutouts = MakeCutouts(224, 64, cut_pow=1.)
+# make_cutouts = MakeCutouts(cut_size, args.cutn, cut_pow=args.cut_pow)
+
+def vector_quantize(x, codebook):
+    d = x.pow(2).sum(dim=-1, keepdim=True) + codebook.pow(2).sum(dim=1) - 2 * x @ codebook.T
+    indices = d.argmin(-1)
+    x_q = F.one_hot(indices, codebook.shape[0]).to(d.dtype) @ codebook
+    return replace_grad(x_q, x)
+
+class ReplaceGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_forward, x_backward):
+        ctx.shape = x_backward.shape
+        return x_forward
+
+    @staticmethod
+    def backward(ctx, grad_in):
+        return None, grad_in.sum_to_size(ctx.shape)
+
+replace_grad = ReplaceGrad.apply
+
+class ClampWithGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, min, max):
+        ctx.min = min
+        ctx.max = max
+        ctx.save_for_backward(input)
+        return input.clamp(min, max)
+
+    @staticmethod
+    def backward(ctx, grad_in):
+        input, = ctx.saved_tensors
+        return grad_in * (grad_in * (input - input.clamp(ctx.min, ctx.max)) >= 0), None, None
+
+clamp_with_grad = ClampWithGrad.apply
+
+normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                 std=[0.26862954, 0.26130258, 0.27577711])
 
 def create_outputfolder():
     outputfolder = os.path.join(os.getcwd(), 'output')
@@ -67,7 +190,7 @@ def create_image(img, i, text, gen, pre_scaled=True):
 nom = torchvision.transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
 
 class Pars(torch.nn.Module):
-    def __init__(self, gen='biggan'):
+    def __init__(self, gen='biggan', model=None):
         super(Pars, self).__init__()
         self.gen = gen
         if self.gen == 'biggan':
@@ -85,6 +208,21 @@ class Pars(torch.nn.Module):
             latent_shape = (1, 1, 512)
             latents_init = torch.zeros(latent_shape).squeeze(-1).cuda()
             self.normu = torch.nn.Parameter(latents_init, requires_grad=True)
+
+        elif self.gen == 'vqgan':
+            n_toks = 1024 #model.quantize.n_e
+            f = 16 #2**(model.decoder.num_resolutions - 1)
+            toksX, toksY = 512 // f, 512 // f
+            e_dim = 256 #model.quantize.e_dim
+
+            one_hot = F.one_hot(torch.randint(n_toks, [toksY * toksX]).cuda(), n_toks).float()
+            z = one_hot @ model.quantize.embedding.weight
+            #self.normu = z.view([-1, toksY, toksX, e_dim]).permute(0, 3, 1, 2)
+            self.normu = torch.nn.Parameter(
+                z.view([-1, toksY, toksX, e_dim]).permute(0, 3, 1, 2),
+                requires_grad=True
+            )
+            # self.normu = torch.nn.Parameter(torch.zeros(1, 256, 30, 30).cuda())
 
     def forward(self):
         if self.gen == 'biggan':
@@ -133,6 +271,24 @@ def ascend_txt(model, lats, sideX, sideY, perceptor, percep, gen, tokenizedtxt):
         img_logits, _text_logits = perceptor(img, tokenizedtxt.cuda())
 
         return 1/img_logits * 100, img, zs
+    
+    elif gen == 'vqgan':
+
+        pMs = []
+        # txt, weight, stop = parse_prompt(tokenizedtxt)
+        embed = perceptor.encode_text(tokenizedtxt.cuda()).float()
+        pMs.append(Prompt(embed).cuda())
+
+        z = lats.normu 
+        z_q = vector_quantize(z.movedim(1, 3), model.quantize.embedding.weight).movedim(3, 1)
+        out = clamp_with_grad(model.decode(z_q).add(1).div(2), 0, 1)
+        iii = perceptor.encode_image(normalize(make_cutouts(out))).float()
+
+        result = []
+        for prompt in pMs:
+            result.append(prompt(iii))
+
+        return [result, z]
     
     p_s = []
     for ch in range(cutn):
@@ -187,7 +343,11 @@ def train(i, model, lats, sideX, sideY, perceptor, percep, optimizer, text, toke
         loss = loss1[0]
         img  = loss1[1].cpu()
         zs = loss1[2]
-
+    elif gen == 'vqgan':
+        # loss = sum(loss1)
+        loss = sum(loss1[0])
+        # img  = loss1[0].cpu()
+        zs = loss1[1]
 
     optimizer.zero_grad()
     loss.backward()
