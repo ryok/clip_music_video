@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-
-# Taken from https://github.com/IVRL/GANLocalEditing
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -321,7 +316,8 @@ class G_synthesis(nn.Module):
     def __init__(self,
         dlatent_size        = 512,          # Disentangled latent (W) dimensionality.
         num_channels        = 3,            # Number of output color channels.
-        resolution          = 1024,         # Output resolution.
+        resolution          = 512,         # Output resolution.
+        #resolution          = 1024,         # Output resolution.
         fmap_base           = 8192,         # Overall multiplier for the number of feature maps.
         fmap_decay          = 1.0,          # log2 feature map reduction when doubling the resolution.
         fmap_max            = 512,          # Maximum number of feature maps in any layer.
@@ -376,6 +372,23 @@ class G_synthesis(nn.Module):
                 x = m(x, dlatents_in[:, 2*i:2*i+2])
         rgb = self.torgb(x)
         return rgb
+
+
+def g_synthesis_awesomeweight(weight_name):
+    avg_latent = torch.zeros(1, 18, 512)
+
+    g_all = nn.Sequential(OrderedDict([
+        ('g_mapping', G_mapping()),
+        # ('truncation', Truncation(avg_latent)),
+        ('g_synthesis', G_synthesis())    
+    ]))
+
+    g_all.load_state_dict(torch.load(weight_name))
+
+    g_synthesis = g_all.g_synthesis
+    g_mapping = g_all.g_mapping
+
+    return g_synthesis
 
 
 avg_latent = torch.zeros(1, 18, 512)
