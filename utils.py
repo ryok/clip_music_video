@@ -173,7 +173,7 @@ def init_textfile(textfile):
     return descs1
 
 def create_image(img, i, text, gen, pre_scaled=True):
-    if gen == 'stylegan':
+    if gen == 'stylegan' or gen == 'stylegan_1024':
         img = (img.clamp(-1, 1) + 1) / 2.0
         img = img[0].permute(1, 2, 0).detach().cpu().numpy() * 256
     else:
@@ -204,7 +204,7 @@ class Pars(torch.nn.Module):
         elif self.gen == 'dall-e':
             self.normu = torch.nn.Parameter(torch.zeros(1, 8192, 64, 64).cuda())
 
-        elif self.gen == 'stylegan':
+        elif self.gen == 'stylegan' or self.gen == 'stylegan_1024':
             latent_shape = (1, 1, 512)
             latents_init = torch.zeros(latent_shape).squeeze(-1).cuda()
             self.normu = torch.nn.Parameter(latents_init, requires_grad=True)
@@ -212,7 +212,9 @@ class Pars(torch.nn.Module):
         elif self.gen == 'vqgan':
             n_toks = 1024 #model.quantize.n_e
             f = 16 #2**(model.decoder.num_resolutions - 1)
-            toksX, toksY = 512 // f, 512 // f
+            # toksX, toksY = 512 // f, 512 // f
+            toksX, toksY = 768 // f, 768 // f
+            # toksX, toksY = 1600 // f, 512 // f
             e_dim = 256 #model.quantize.e_dim
 
             one_hot = F.one_hot(torch.randint(n_toks, [toksY * toksX]).cuda(), n_toks).float()
@@ -263,7 +265,7 @@ def ascend_txt(model, lats, sideX, sideY, perceptor, percep, gen, tokenizedtxt):
         zs = lats()
         out = unmap_pixels(torch.sigmoid(model(zs)[:, :3].float()))
 
-    elif gen == 'stylegan':
+    elif gen == 'stylegan' or gen == 'stylegan_1024':
         zs = lats.normu.repeat(1,18,1)
         img = model(zs)
         img = torch.nn.functional.upsample_bilinear(img, (224, 224))
@@ -339,7 +341,7 @@ def train(i, model, lats, sideX, sideY, perceptor, percep, optimizer, text, toke
         loss = loss1[0] + loss1[1]
         loss = loss.mean()
         zs = loss1[2]
-    elif gen == 'stylegan':
+    elif gen == 'stylegan' or gen == 'stylegan_1024':
         loss = loss1[0]
         img  = loss1[1].cpu()
         zs = loss1[2]
