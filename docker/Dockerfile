@@ -13,6 +13,12 @@ ADD requirements.txt /tmp/requirements.txt
 
 RUN pip install -r /tmp/requirements.txt
 
+WORKDIR /
+
 RUN git clone https://github.com/openai/CLIP.git
 
+RUN git clone https://github.com/CompVis/taming-transformers.git
+
 ADD policy.xml /etc/ImageMagick-6/policy.xml
+
+WORKDIR /workspace

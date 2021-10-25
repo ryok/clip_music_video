@@ -4,6 +4,9 @@ from stylegan       import g_synthesis
 from biggan         import BigGAN
 from tqdm           import tqdm
 from omegaconf import OmegaConf
+import sys
+
+sys.path.append("/")
 
 import create_video
 import tempfile
@@ -16,8 +19,8 @@ import os
 import math
 from torch.nn import functional as F
 
-import sys
-sys.path.append('./taming-transformers')
+sys.path.append('/taming-transformers')
+# sys.path.append('./taming-transformers')
 
 from taming.models import cond_transformer, vqgan
 
